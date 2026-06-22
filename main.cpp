@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <map>
 #include <QMenu>
 #include <QContextMenuEvent>
 #include <QWidget>
@@ -46,6 +47,19 @@ static std::optional<double> readNumberFile(const fs::path& path)
     return v;
 }
 
+enum class DisplayMode {
+    Carousel,
+    Cpu,
+    Gpu,
+    Ram,
+    Vram,
+    NetDown,
+    NetUp,
+    SplitCpuGpuRam,
+    PhysicalCpus
+};
+
+
 class SysStats {
 public:
     SysStats()
@@ -91,6 +105,76 @@ public:
         if (totalDelta == 0) return 0.0;
 
         return 100.0 * static_cast<double>(totalDelta - idleDelta) / static_cast<double>(totalDelta);
+    }
+
+    std::vector<double> physicalCpuPercents()
+    {
+        std::ifstream f("/proc/stat");
+        if (!f.is_open()) return {};
+
+        std::vector<CpuTick> current;
+        std::string line;
+
+        while (std::getline(f, line)) {
+            if (line.rfind("cpu", 0) != 0) break;
+            if (line.size() < 4 || !std::isdigit(line[3])) continue;
+
+            std::istringstream ss(line);
+
+            std::string label;
+            unsigned long long user = 0;
+            unsigned long long nice = 0;
+            unsigned long long system = 0;
+            unsigned long long idle = 0;
+            unsigned long long iowait = 0;
+            unsigned long long irq = 0;
+            unsigned long long softirq = 0;
+            unsigned long long steal = 0;
+
+            ss >> label >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal;
+
+            CpuTick t;
+            t.idle = idle + iowait;
+            t.total = user + nice + system + idle + iowait + irq + softirq + steal;
+
+            current.push_back(t);
+        }
+
+        if (current.empty()) return {};
+
+        auto groups = physicalCoreGroups(static_cast<int>(current.size()));
+
+        if (!haveLogicalCpu || lastLogicalCpu.size() != current.size()) {
+            lastLogicalCpu = current;
+            haveLogicalCpu = true;
+            return std::vector<double>(groups.size(), 0.0);
+        }
+
+        std::vector<double> result;
+
+        for (const auto& group : groups) {
+            unsigned long long totalDelta = 0;
+            unsigned long long idleDelta = 0;
+
+            for (int cpuIndex : group) {
+                if (cpuIndex < 0 || cpuIndex >= static_cast<int>(current.size())) continue;
+
+                totalDelta += current[cpuIndex].total - lastLogicalCpu[cpuIndex].total;
+                idleDelta  += current[cpuIndex].idle  - lastLogicalCpu[cpuIndex].idle;
+            }
+
+            double usage = 0.0;
+
+            if (totalDelta > 0) {
+                usage = 100.0 * static_cast<double>(totalDelta - idleDelta)
+                    / static_cast<double>(totalDelta);
+            }
+
+            result.push_back(std::clamp(usage, 0.0, 100.0));
+        }
+
+        lastLogicalCpu = current;
+        return result;
     }
 
     double memPercent()
@@ -207,6 +291,14 @@ private:
     bool haveCpu = false;
     unsigned long long lastCpuTotal = 0;
     unsigned long long lastCpuIdle = 0;
+    struct CpuTick {
+        unsigned long long idle = 0;
+        unsigned long long total = 0;
+    };
+
+    bool haveLogicalCpu = false;
+    std::vector<CpuTick> lastLogicalCpu;
+    std::vector<std::vector<int>> physicalCoreGroupsCache;
 
     bool haveNet = false;
     unsigned long long lastRx = 0;
@@ -252,6 +344,48 @@ private:
             }
         }
     }
+
+    std::vector<std::vector<int>> physicalCoreGroups(int logicalCpuCount)
+    {
+        if (!physicalCoreGroupsCache.empty()) {
+            return physicalCoreGroupsCache;
+        }
+
+        std::map<std::pair<int, int>, std::vector<int>> grouped;
+
+        for (int i = 0; i < logicalCpuCount; ++i) {
+            fs::path base = fs::path("/sys/devices/system/cpu") / ("cpu" + std::to_string(i)) / "topology";
+
+            auto packageValue = readNumberFile(base / "physical_package_id");
+            auto coreValue = readNumberFile(base / "core_id");
+
+            if (!packageValue || !coreValue) {
+                physicalCoreGroupsCache.push_back({i});
+                continue;
+            }
+
+            int packageId = static_cast<int>(*packageValue);
+            int coreId = static_cast<int>(*coreValue);
+
+            grouped[{packageId, coreId}].push_back(i);
+        }
+
+        if (!grouped.empty()) {
+            physicalCoreGroupsCache.clear();
+
+            for (const auto& item : grouped) {
+                physicalCoreGroupsCache.push_back(item.second);
+            }
+        }
+
+        if (physicalCoreGroupsCache.empty()) {
+            for (int i = 0; i < logicalCpuCount; ++i) {
+                physicalCoreGroupsCache.push_back({i});
+            }
+        }
+
+        return physicalCoreGroupsCache;
+    }
 };
 
 class ThinMon : public QWidget {
@@ -288,8 +422,10 @@ public:
 
         swapTimer = new QTimer(this);
         connect(swapTimer, &QTimer::timeout, this, [this]() {
-            currentGraph = (currentGraph + 1) % graphs.size();
-            update();
+            if (displayMode == DisplayMode::Carousel) {
+                currentGraph = (currentGraph + 1) % graphs.size();
+                update();
+            }
         });
         swapTimer->start(5000);
 
@@ -301,13 +437,56 @@ protected:
     void contextMenuEvent(QContextMenuEvent* event) override
     {
         QMenu menu(this);
+
+        QAction* carouselAction = menu.addAction("Carousel / 5s swap");
+        QAction* cpuAction      = menu.addAction("CPU");
+        QAction* physicalCpuAction = menu.addAction("Physical CPUs");
+        QAction* gpuAction      = menu.addAction("GPU");
+        QAction* ramAction      = menu.addAction("RAM");
+        QAction* vramAction     = menu.addAction("VRAM");
+        QAction* downAction     = menu.addAction("Net Down");
+        QAction* upAction       = menu.addAction("Net Up");
+
+        menu.addSeparator();
+
+        QAction* splitAction = menu.addAction("Split: CPU | GPU | RAM");
+
+        menu.addSeparator();
+
         QAction* quitAction = menu.addAction("Quit ThinMon");
-    
+
         QAction* selected = menu.exec(event->globalPos());
-    
-        if (selected == quitAction) {
+
+        if (selected == carouselAction) {
+            displayMode = DisplayMode::Carousel;
+        } else if (selected == cpuAction) {
+            displayMode = DisplayMode::Cpu;
+            currentGraph = 0;
+        } else if (selected == physicalCpuAction) {
+            displayMode = DisplayMode::PhysicalCpus;
+        } else if (selected == gpuAction) {
+            displayMode = DisplayMode::Gpu;
+            currentGraph = 1;
+        } else if (selected == ramAction) {
+            displayMode = DisplayMode::Ram;
+            currentGraph = 2;
+        } else if (selected == vramAction) {
+            displayMode = DisplayMode::Vram;
+            currentGraph = 3;
+        } else if (selected == downAction) {
+            displayMode = DisplayMode::NetDown;
+            currentGraph = 4;
+        } else if (selected == upAction) {
+            displayMode = DisplayMode::NetUp;
+            currentGraph = 5;
+        } else if (selected == splitAction) {
+            displayMode = DisplayMode::SplitCpuGpuRam;
+        } else if (selected == quitAction) {
             QApplication::quit();
+            return;
         }
+
+        update();
     }
 
     void showEvent(QShowEvent*) override
@@ -327,41 +506,58 @@ protected:
 
         if (graphs.empty()) return;
 
-        const Graph& g = graphs[currentGraph];
+        if (displayMode == DisplayMode::PhysicalCpus) {
+            drawPhysicalCpuPanel(p, rect());
+            return;
+        }
 
-        int labelW = 125;
-        int plotX = labelW;
-        int plotY = 5;
-        int plotW = width() - plotX - 8;
-        int plotH = height() - 10;
+        if (displayMode == DisplayMode::SplitCpuGpuRam) {
+            int third = width() / 3;
 
-        if (plotW <= 10 || plotH <= 10) return;
+            QRect cpuRect(0, 0, third, height());
+            QRect gpuRect(third, 0, third, height());
+            QRect ramRect(third * 2, 0, width() - third * 2, height());
 
-        p.setPen(QColor(230, 230, 230));
-        p.drawText(8, 18, g.name);
+            p.setPen(QColor(60, 60, 60));
+            p.drawLine(gpuRect.left(), 0, gpuRect.left(), height());
+            p.drawLine(ramRect.left(), 0, ramRect.left(), height());
 
-        p.setPen(valueColor(normalizedValue(g.current, scaleFor(g))));
-        p.drawText(8, 38, formatValue(g.current, g.unit));
+            drawGraphPanel(p, graphs[0], cpuRect, "split");
+            drawGraphPanel(p, graphs[1], gpuRect, "split");
+            drawGraphPanel(p, graphs[2], ramRect, "split");
+            return;
+        }
 
-        p.setPen(QColor(95, 95, 95));
-        p.drawText(8, 56, "5s swap");
+        int graphIndex = currentGraph;
+        QString modeText = "5s swap";
 
-        drawGrid(p, plotX, plotY, plotW, plotH);
-        drawDotGraph(p, g, plotX, plotY, plotW, plotH);
+        if (displayMode != DisplayMode::Carousel) {
+            modeText = "locked";
 
-        p.setPen(QColor(120, 120, 120));
-        QString maxText = "max " + formatValue(scaleFor(g), g.unit);
-        p.drawText(width() - 115, 18, maxText);
+            switch (displayMode) {
+                case DisplayMode::Cpu:     graphIndex = 0; break;
+                case DisplayMode::Gpu:     graphIndex = 1; break;
+                case DisplayMode::Ram:     graphIndex = 2; break;
+                case DisplayMode::Vram:    graphIndex = 3; break;
+                case DisplayMode::NetDown: graphIndex = 4; break;
+                case DisplayMode::NetUp:   graphIndex = 5; break;
+                default: break;
+            }
+        }
+
+        drawGraphPanel(p, graphs[graphIndex], rect(), modeText);
     }
 
 private:
     SysStats stats;
     QVector<Graph> graphs;
+    QVector<Graph> physicalCpuGraphs;
 
     QTimer* sampleTimer = nullptr;
     QTimer* swapTimer = nullptr;
 
     int currentGraph = 0;
+    DisplayMode displayMode = DisplayMode::Carousel;
 
     void sample()
     {
@@ -369,6 +565,26 @@ private:
         appendSample(graphs[1], stats.gpuPercent());
         appendSample(graphs[2], stats.memPercent());
         appendSample(graphs[3], stats.vramPercent());
+
+        auto physicalCpus = stats.physicalCpuPercents();
+
+        if (physicalCpuGraphs.size() != static_cast<int>(physicalCpus.size())) {
+            physicalCpuGraphs.clear();
+
+            for (int i = 0; i < static_cast<int>(physicalCpus.size()); ++i) {
+                physicalCpuGraphs.push_back(Graph{
+                    "CPU " + QString::number(i),
+                    Unit::Percent,
+                    false,
+                    0.0,
+                    {}
+                });
+            }
+        }
+
+        for (int i = 0; i < static_cast<int>(physicalCpus.size()); ++i) {
+            appendSample(physicalCpuGraphs[i], physicalCpus[i]);
+        }
 
         auto [downKiB, upKiB] = stats.netRatesKiB();
 
@@ -475,7 +691,69 @@ private:
 
         return QString::number(value, 'f', 0) + " KiB/s";
     }
+    void drawGraphPanel(QPainter& p, const Graph& g, const QRect& area, const QString& modeText)
+    {
+        int labelW = 125;
+        int plotX = area.left() + labelW;
+        int plotY = area.top() + 5;
+        int plotW = area.width() - labelW - 8;
+        int plotH = area.height() - 10;
 
+        if (plotW <= 10 || plotH <= 10) return;
+
+        p.setPen(QColor(230, 230, 230));
+        p.drawText(area.left() + 8, area.top() + 18, g.name);
+
+        p.setPen(valueColor(normalizedValue(g.current, scaleFor(g))));
+        p.drawText(area.left() + 8, area.top() + 38, formatValue(g.current, g.unit));
+
+        p.setPen(QColor(95, 95, 95));
+        p.drawText(area.left() + 8, area.top() + 56, modeText);
+
+        drawGrid(p, plotX, plotY, plotW, plotH);
+        drawDotGraph(p, g, plotX, plotY, plotW, plotH);
+
+        p.setPen(QColor(120, 120, 120));
+        QString maxText = "max " + formatValue(scaleFor(g), g.unit);
+        p.drawText(area.right() - 115, area.top() + 18, maxText);
+    }
+    void drawPhysicalCpuPanel(QPainter& p, const QRect& area)
+    {
+        if (physicalCpuGraphs.empty()) return;
+
+        int cores = physicalCpuGraphs.size();
+        int panelW = std::max(1, area.width() / cores);
+
+        for (int i = 0; i < cores; ++i) {
+            int left = area.left() + i * panelW;
+            int right = (i == cores - 1) ? area.right() : left + panelW - 1;
+
+            QRect panel(left, area.top(), right - left + 1, area.height());
+
+            if (i > 0) {
+                p.setPen(QColor(60, 60, 60));
+                p.drawLine(panel.left(), panel.top(), panel.left(), panel.bottom());
+            }
+
+            const Graph& g = physicalCpuGraphs[i];
+
+            p.setPen(QColor(230, 230, 230));
+            p.drawText(panel.left() + 6, panel.top() + 14, g.name);
+
+            p.setPen(valueColor(normalizedValue(g.current, 100.0)));
+            p.drawText(panel.left() + 6, panel.top() + 30, formatValue(g.current, g.unit));
+
+            int plotX = panel.left() + 6;
+            int plotY = panel.top() + 34;
+            int plotW = panel.width() - 12;
+            int plotH = panel.height() - 38;
+
+            if (plotW <= 10 || plotH <= 8) continue;
+
+            drawGrid(p, plotX, plotY, plotW, plotH);
+            drawDotGraph(p, g, plotX, plotY, plotW, plotH);
+        }
+    }
     void drawGrid(QPainter& p, int x, int y, int w, int h)
     {
         p.setPen(QColor(35, 35, 35));
