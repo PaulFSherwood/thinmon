@@ -25,6 +25,10 @@ A small X11 desktop monitor bar for Linux. It sits along the bottom of a seconda
 
 ![RAM graph](images/RAM.png)
 
+## CPU-GPU-RAM
+
+![CPU-GPU-RAM.png](/home/sherwood/Documents/src/projects/thinmon/images/CPU-GPU-RAM.png)
+
 ### VRAM
 
 ![VRAM graph](images/VRAM.png)
@@ -37,11 +41,16 @@ A small X11 desktop monitor bar for Linux. It sits along the bottom of a seconda
 
 ![Network upload graph](images/NetUp.png)
 
+## Right Click Menu
+
+![right-click.png](/home/sherwood/Documents/src/projects/thinmon/images/right-click.png)
+
 ## Project layout
 
 ```text
 thinmon/
 ├── images/
+│   ├── CPU-GPU-RAM.png
 │   ├── CPU.png
 │   ├── GPU.png
 │   ├── NetDown.png
