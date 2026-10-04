@@ -21,7 +21,7 @@ cat > "$DESKTOP_FILE" <<EOF
 Type=Application
 Name=ThinMon
 Comment=Small btop-style system monitor strip
-Exec=env THINMON_SCREEN=1 THINMON_HEIGHT=60 $BIN_PATH
+Exec=env THINMON_HEIGHT=60 $BIN_PATH
 Icon=utilities-system-monitor
 Terminal=false
 Categories=System;Monitor;

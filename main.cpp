@@ -1,3 +1,4 @@
+#include <LayerShellQt/shell.h>
 #include <QApplication>
 #include <map>
 #include <QMenu>
@@ -9,6 +10,10 @@
 #include <QGuiApplication>
 #include <QString>
 #include <QVector>
+// Extrac includes to fix the wayland position issue.
+#include <QWindow>
+#include <LayerShellQt/Shell>
+#include <LayerShellQt/Window>
 
 #include <algorithm>
 #include <chrono>
@@ -430,7 +435,7 @@ public:
         swapTimer->start(5000);
 
         sample();
-        moveToConfiguredScreen();
+        // moveToConfiguredScreen();
     }
 
 protected:
@@ -491,7 +496,7 @@ protected:
 
     void showEvent(QShowEvent*) override
     {
-        moveToConfiguredScreen();
+        // moveToConfiguredScreen();
     }
 
     void paintEvent(QPaintEvent*) override
@@ -615,8 +620,18 @@ private:
 
         bool okScreen = false;
         int screenIndex = qEnvironmentVariableIntValue("THINMON_SCREEN", &okScreen);
-        if (!okScreen) screenIndex = 1;
+        if (!okScreen) {
+            screenIndex = 0;
+            int bestX = std::numeric_limits<int>::max();
 
+            for (int i = 0; i < screens.size(); ++i) {
+                const QRect& geom = screens[i]->geometry();
+                if (geom.x() > 0 && geom.x() < bestX) {
+                    bestX = geom.x();
+                    screenIndex = i;
+                }
+            }
+        }
         if (screenIndex < 0 || screenIndex >= screens.size()) {
             screenIndex = 0;
         }
@@ -811,9 +826,54 @@ private:
 
 int main(int argc, char** argv)
 {
+    // LayerShellQt::Shell::useLayerShell();
+
     QApplication app(argc, argv);
 
     ThinMon w;
+
+    // Find DP-2, the monitor on the right.
+    QScreen* targetScreen = nullptr;
+
+    for (QScreen* screen : QGuiApplication::screens()) {
+        if (screen->name() == "DP-1") {
+            targetScreen = screen;
+            break;
+        }
+    }
+
+    if (!targetScreen) {
+        targetScreen = QGuiApplication::primaryScreen();
+    }
+
+    // Force creation of the underlying QWindow.
+    w.winId();
+
+    QWindow* window = w.windowHandle();
+
+    if (window) {
+        window->setScreen(targetScreen);
+
+        LayerShellQt::Window* layer =
+            LayerShellQt::Window::get(window);
+
+        layer->setLayer(
+            LayerShellQt::Window::LayerTop
+        );
+
+        LayerShellQt::Window::Anchors anchors;
+
+        anchors.setFlag(LayerShellQt::Window::AnchorBottom);
+        anchors.setFlag(LayerShellQt::Window::AnchorLeft);
+        anchors.setFlag(LayerShellQt::Window::AnchorRight);
+
+        layer->setAnchors(anchors);
+
+        layer->setDesiredSize(QSize(0, 60));
+        layer->setExclusiveZone(0);
+        layer->setScope(QStringLiteral("thinmon"));
+    }
+
     w.show();
 
     return app.exec();
